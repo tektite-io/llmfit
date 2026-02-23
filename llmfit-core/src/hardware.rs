@@ -88,9 +88,7 @@ impl SystemSpecs {
         let has_gpu = !gpus.is_empty();
         let gpu_vram_gb = primary.and_then(|g| g.vram_gb);
         // Total VRAM = per-card VRAM * count (for multi-GPU tensor splitting)
-        let total_gpu_vram_gb = primary.and_then(|g| {
-            g.vram_gb.map(|vram| vram * g.count as f64)
-        });
+        let total_gpu_vram_gb = primary.and_then(|g| g.vram_gb.map(|vram| vram * g.count as f64));
         let gpu_name = primary.map(|g| g.name.clone());
         let gpu_count = primary.map(|g| g.count).unwrap_or(0);
         let unified_memory = primary.map(|g| g.unified_memory).unwrap_or(false);
