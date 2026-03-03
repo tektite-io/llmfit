@@ -559,19 +559,7 @@ impl LlamaCppProvider {
         let Ok(entries) = resp.into_body().read_json::<Vec<serde_json::Value>>() else {
             return Vec::new();
         };
-        entries
-            .into_iter()
-            .filter_map(|e| {
-                let path = e.get("path")?.as_str()?.to_string();
-                if !path.ends_with(".gguf") {
-                    return None;
-                }
-                let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-                // Skip split files (e.g., model-00001-of-00003.gguf) but not the
-                // primary file. We look for files that look like quantized models.
-                Some((path, size))
-            })
-            .collect()
+        parse_repo_gguf_entries(entries)
     }
 
     /// Select the best GGUF file from a repo that fits within a memory budget.
@@ -769,18 +757,17 @@ impl LlamaCppProvider {
     }
 }
 
-/// Check if a filename looks like a split GGUF shard (e.g., model-00001-of-00003.gguf).
-/// Validate a GGUF filename to prevent path traversal attacks.
-///
-/// Rejects:
-/// - Empty filenames
-/// - Absolute paths
-/// - Path traversal components (`..`)
-/// - Filenames that don't end in `.gguf` or `.gguf.part`
-/// - Filenames containing path separators (subdirectory attempts)
+/// Validate a GGUF filename used for local cache writes.
 fn validate_gguf_filename(filename: &str) -> Result<(), String> {
     if filename.is_empty() {
         return Err("GGUF filename must not be empty".to_string());
+    }
+
+    if filename.contains('/') || filename.contains('\\') {
+        return Err(format!(
+            "Security: path separators not allowed in GGUF filename: {}",
+            filename
+        ));
     }
 
     let path = std::path::Path::new(filename);
@@ -792,17 +779,6 @@ fn validate_gguf_filename(filename: &str) -> Result<(), String> {
         ));
     }
 
-    // Reject any path component that is ".."
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err(format!(
-                "Security: path traversal not allowed in GGUF filename: {}",
-                filename
-            ));
-        }
-    }
-
-    // Must end in .gguf
     if !filename.ends_with(".gguf") {
         return Err(format!(
             "GGUF filename must end in .gguf, got: {}",
@@ -810,10 +786,9 @@ fn validate_gguf_filename(filename: &str) -> Result<(), String> {
         ));
     }
 
-    // Reject path separators (no subdirectories)
-    if filename.contains('/') || filename.contains('\\') {
+    if path.file_name().and_then(|n| n.to_str()) != Some(filename) {
         return Err(format!(
-            "Security: path separators not allowed in GGUF filename: {}",
+            "Security: GGUF filename must be a basename without path components: {}",
             filename
         ));
     }
@@ -824,6 +799,22 @@ fn validate_gguf_filename(filename: &str) -> Result<(), String> {
 fn is_split_file(filename: &str) -> bool {
     // Pattern: anything with "-NNNNN-of-NNNNN" before .gguf
     filename.contains("-of-")
+}
+
+fn parse_repo_gguf_entries(entries: Vec<serde_json::Value>) -> Vec<(String, u64)> {
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let path = e.get("path")?.as_str()?.to_string();
+            if validate_gguf_filename(&path).is_err() {
+                return None;
+            }
+            let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Skip split files (e.g., model-00001-of-00003.gguf) but not the
+            // primary file. We look for files that look like quantized models.
+            Some((path, size))
+        })
+        .collect()
 }
 
 /// Default directory for llama.cpp GGUF model cache.
@@ -1602,6 +1593,7 @@ mod tests {
     fn test_validate_gguf_filename_bad_extension() {
         assert!(validate_gguf_filename("malware.exe").is_err());
         assert!(validate_gguf_filename("script.sh").is_err());
+        assert!(validate_gguf_filename("./model.guuf").is_err());
     }
 
     #[test]
@@ -1612,5 +1604,28 @@ mod tests {
     #[test]
     fn test_validate_gguf_filename_subdirectory() {
         assert!(validate_gguf_filename("subdir/model.gguf").is_err());
+    }
+
+    #[test]
+    fn test_validate_gguf_filename_rejects_non_basename_forms() {
+        assert!(validate_gguf_filename("./model.gguf").is_err());
+        assert!(validate_gguf_filename("model.gguf/").is_err());
+        assert!(validate_gguf_filename(".\\model.gguf").is_err());
+        assert!(validate_gguf_filename("C:/models/model.gguf").is_err());
+        assert!(validate_gguf_filename("C:\\models\\model.gguf").is_err());
+    }
+
+    #[test]
+    fn test_parse_repo_gguf_entries_filters_unsafe_paths() {
+        let entries = vec![
+            serde_json::json!({"path": "good.gguf", "size": 123u64}),
+            serde_json::json!({"path": "../escape.gguf", "size": 456u64}),
+            serde_json::json!({"path": "nested/model.gguf", "size": 789u64}),
+            serde_json::json!({"path": "./model.gguf", "size": 99u64}),
+            serde_json::json!({"path": "readme.md", "size": 12u64}),
+        ];
+
+        let files = parse_repo_gguf_entries(entries);
+        assert_eq!(files, vec![("good.gguf".to_string(), 123u64)]);
     }
 }
